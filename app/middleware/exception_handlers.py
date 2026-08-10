@@ -13,7 +13,6 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.exceptions import AppException
 from app.core.logging import get_logger
-from fastapi.encoders import jsonable_encoder
 
 logger = get_logger(__name__)
 
@@ -24,13 +23,16 @@ def _error_body(error_code: str, message: str, details: dict | None = None) -> d
 
 async def app_exception_handler(request: Request, exc: AppException) -> JSONResponse:
     logger.warning(
-    "app_exception",
-    extra={
-        "path": request.url.path,
-        "error_code": exc.error_code,
-        "detail": exc.message,
-    },
-)
+        "app_exception",
+        extra={
+            "path": request.url.path,
+            "error_code": exc.error_code,
+            # NOT "message" — that key collides with the reserved
+            # `LogRecord.message` attribute and raises a KeyError from the
+            # logging module on every single call.
+            "error_message": exc.message,
+        },
+    )
     return JSONResponse(
         status_code=exc.status_code,
         content=_error_body(exc.error_code, exc.message, exc.extra or None),
@@ -42,14 +44,13 @@ async def validation_exception_handler(
 ) -> JSONResponse:
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content=jsonable_encoder(
-            _error_body(
-                "validation_error",
-                "Request validation failed",
-                {"errors": exc.errors()},
-            )
+        content=_error_body(
+            "validation_error",
+            "Request validation failed",
+            {"errors": exc.errors()},
         ),
     )
+
 
 async def http_exception_handler(
     request: Request, exc: StarletteHTTPException

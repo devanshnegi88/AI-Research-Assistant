@@ -12,12 +12,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
+from app.core.dependencies import get_vector_store_dep
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
 from app.models.enums import RoleEnum
 from app.models.user import User
 from app.core.security import hash_password
+from app.vectorstore.base import VectorStore
 
 TEST_DATABASE_URL = str(settings.DATABASE_URL).rsplit("/", 1)[0] + "/test_" + str(
     settings.DATABASE_URL
@@ -27,6 +29,28 @@ test_engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
 TestSessionLocal = async_sessionmaker(
     bind=test_engine, class_=AsyncSession, expire_on_commit=False
 )
+
+
+class _NoOpVectorStore(VectorStore):
+    """Default vector store override for tests — no real Qdrant needed.
+
+    Individual tests (e.g. `test_search.py`) can override
+    `get_vector_store_dep` again with a fixture-specific fake for
+    assertions on returned results; this just prevents document
+    upload/delete tests from attempting a real network call.
+    """
+
+    async def upsert(self, records):
+        pass
+
+    async def search(self, query_vector, top_k, filters=None):
+        return []
+
+    async def delete(self, ids):
+        pass
+
+    async def delete_by_filter(self, filters):
+        pass
 
 
 @pytest.fixture(scope="session")
@@ -58,6 +82,7 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
         yield db_session
 
     app.dependency_overrides[get_db] = _override_get_db
+    app.dependency_overrides[get_vector_store_dep] = lambda: _NoOpVectorStore()
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac

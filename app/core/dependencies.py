@@ -8,25 +8,34 @@ from __future__ import annotations
 import uuid
 
 from fastapi import Depends
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.security import OAuth2PasswordBearer
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.exceptions import ForbiddenException, InvalidTokenException
 from app.core.security import decode_token
+# from app.db.redis import get_redis
 from app.db.session import get_db
 from app.models.enums import RoleEnum
 from app.models.user import User
+from app.repositories.chunk_repository import ChunkRepository
 from app.repositories.document_repository import DocumentRepository
 from app.repositories.user_repository import UserRepository
 from app.services.auth_service import AuthService
 from app.services.document.document_service import DocumentService
+from app.services.embeddings.embedding_service import EmbeddingService, get_embedding_service
+from app.services.rag.llm_client import LLMClient, get_llm_client
+from app.services.rag.rag_service import RAGService
+from app.services.search.retriever import HybridRetriever
+from app.services.search.search_service import SearchService
 from app.services.user_service import UserService
 from app.storage.base import StorageBackend
 from app.storage.local_storage import get_storage_backend
+from app.vectorstore.base import VectorStore
+from app.vectorstore.qdrant_store import get_vector_store
 
-
-security = HTTPBearer(auto_error=True)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_PREFIX}/auth/login")
 
 
 # --- Repositories ---
@@ -43,10 +52,27 @@ def get_storage() -> StorageBackend:
     return get_storage_backend()
 
 
+def get_chunk_repository(db: AsyncSession = Depends(get_db)) -> ChunkRepository:
+    return ChunkRepository(db)
+
+
+def get_vector_store_dep() -> VectorStore:
+    return get_vector_store()
+
+
+def get_embedding_service_dep() -> EmbeddingService:
+    return get_embedding_service()
+
+
+def get_llm_client_dep() -> LLMClient:
+    return get_llm_client()
+
+
 # --- Services ---
 
 def get_auth_service(
     user_repository: UserRepository = Depends(get_user_repository),
+    # redis: Redis = Depends(get_redis),
 ) -> AuthService:
     return AuthService(user_repository)
 
@@ -60,29 +86,46 @@ def get_user_service(
 def get_document_service(
     document_repository: DocumentRepository = Depends(get_document_repository),
     storage: StorageBackend = Depends(get_storage),
+    vector_store: VectorStore = Depends(get_vector_store_dep),
 ) -> DocumentService:
-    return DocumentService(document_repository, storage)
+    return DocumentService(document_repository, storage, vector_store)
+
+
+def get_hybrid_retriever(
+    vector_store: VectorStore = Depends(get_vector_store_dep),
+    # embedding_service: EmbeddingService = Depends(get_embedding_service_dep),
+    chunk_repository: ChunkRepository = Depends(get_chunk_repository),
+) -> HybridRetriever:
+    return HybridRetriever(vector_store , chunk_repository)
+
+
+def get_search_service(
+    retriever: HybridRetriever = Depends(get_hybrid_retriever),
+    chunk_repository: ChunkRepository = Depends(get_chunk_repository),
+    document_repository: DocumentRepository = Depends(get_document_repository),
+) -> SearchService:
+    return SearchService(retriever, chunk_repository, document_repository)
+
+
+def get_rag_service(
+    search_service: SearchService = Depends(get_search_service),
+    llm_client: LLMClient = Depends(get_llm_client_dep),
+) -> RAGService:
+    return RAGService(search_service, llm_client)
 
 
 # --- Current user / RBAC ---
 
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    token: str = Depends(oauth2_scheme),
     user_repository: UserRepository = Depends(get_user_repository),
 ) -> User:
-    token = credentials.credentials
-
     payload = decode_token(token)
-
     if payload.get("type") != "access":
         raise InvalidTokenException("Not an access token")
 
     user = await user_repository.get_by_id(uuid.UUID(payload["sub"]))
-
-    if user is None:
-        raise InvalidTokenException("User not found")
-
-    if not user.is_active:
+    if user is None or not user.is_active:
         raise InvalidTokenException("User no longer active")
 
     return user

@@ -7,7 +7,8 @@ services:
       - .env
     environment:
       POSTGRES_HOST: postgres
-      # REDIS_HOST: redis  # Redis removed
+      REDIS_HOST: redis
+      QDRANT_HOST: qdrant
     ports:
       - "8000:8000"
     volumes:
@@ -15,31 +16,50 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      # redis:
-      #   condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
     command: >
       sh -c "alembic upgrade head &&
              uvicorn app.main:app --host 0.0.0.0 --port 8000"
     restart: unless-stopped
 
-  # worker:  # Celery removed — document processing runs inline in the API
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile
-  #   env_file:
-  #     - .env
-  #   environment:
-  #     POSTGRES_HOST: postgres
-  #     REDIS_HOST: redis
-  #   volumes:
-  #     - upload_storage:/app/storage/uploads
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #     redis:
-  #       condition: service_healthy
-  #   command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
-  #   restart: unless-stopped
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      QDRANT_HOST: qdrant
+    volumes:
+      - upload_storage:/app/storage/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "6333:6333"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
 
   postgres:
     image: postgres:16-alpine
@@ -58,20 +78,21 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # redis:  # Redis removed
-  #   image: redis:7-alpine
-  #   volumes:
-  #     - redis_data:/data
-  #   ports:
-  #     - "6379:6379"
-  #   healthcheck:
-  #     test: ["CMD", "redis-cli", "ping"]
-  #     interval: 5s
-  #     timeout: 5s
-  #     retries: 5
-  #   restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
 
 volumes:
   postgres_data:
+  redis_data:
   upload_storage:
-  # redis_data:  # Redis removed
+  qdrant_data:

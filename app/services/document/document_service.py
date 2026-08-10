@@ -1,12 +1,12 @@
 """
 Document business logic.
 
-Upload runs synchronously in the API request:
-1. `upload()` — validate, hash-check for duplicates, persist to storage,
-   insert a DB row, then process it inline (extract → clean → chunk).
-   (Previously this enqueued a Celery task; Celery/Redis has been removed.)
-2. Processing is done here via `_process_document()` using the same async
-   session, so no separate worker/broker is required.
+Upload is split across two phases:
+1. `upload()` (this file, runs in the API request) — validate, hash-check
+   for duplicates, persist to storage, insert a `pending` DB row, enqueue
+   the Celery task. Fast — no extraction/OCR happens here.
+2. `process_document` (Celery task, `workers/tasks.py`) — does the actual
+   extraction, cleaning, and chunking, then updates the row's status.
 """
 
 from __future__ import annotations
@@ -16,15 +16,13 @@ import uuid
 from app.core.config import settings
 from app.core.exceptions import BadRequestException, NotFoundException
 from app.core.logging import get_logger
-from app.models.document import Document, DocumentChunk
+from app.models.document import Document
 from app.models.enums import DocumentStatus, DocumentType
 from app.repositories.document_repository import DocumentRepository
 from app.schemas.common import PaginatedResponse
-from app.services.document.chunking import chunk_text
 from app.services.document.duplicate_detection import compute_content_hash
-from app.services.document.extractors import get_extractor
-from app.services.document.text_cleaning import clean_text
 from app.storage.base import StorageBackend
+from app.vectorstore.base import VectorStore
 
 logger = get_logger(__name__)
 
@@ -40,10 +38,14 @@ _EXTENSION_TO_TYPE: dict[str, DocumentType] = {
 
 class DocumentService:
     def __init__(
-        self, document_repository: DocumentRepository, storage: StorageBackend
+        self,
+        document_repository: DocumentRepository,
+        storage: StorageBackend,
+        vector_store: VectorStore,
     ) -> None:
         self.document_repository = document_repository
         self.storage = storage
+        self.vector_store = vector_store
 
     async def upload(
         self,
@@ -81,58 +83,14 @@ class DocumentService:
         )
         document = await self.document_repository.create(document)
 
-        # Synchronous processing — Celery/Redis removed. Extraction,
-        # cleaning, and chunking happen inline in this request.
-        await self._process_document(document, file_bytes)
+        # Imported lazily to avoid a hard import-time dependency from the
+        # API process on the Celery app configuration.
+        from app.workers.tasks import process_document
+
+        process_document.delay(str(document.id))
 
         logger.info("document_upload_accepted", extra={"document_id": str(document.id)})
         return document
-
-    async def _process_document(self, document: Document, file_bytes: bytes) -> None:
-        """Extract → clean → chunk → persist, inline (no Celery worker)."""
-        try:
-            document.status = DocumentStatus.PROCESSING
-            await self.document_repository.session.flush()
-
-            extractor = get_extractor(document.document_type)
-            result = extractor.extract(file_bytes)
-
-            cleaned_text = clean_text(result.text)
-            chunks = chunk_text(cleaned_text)
-
-            document.extracted_text = cleaned_text
-            document.doc_metadata = {**result.metadata, "used_ocr": result.used_ocr}
-            document.chunk_count = len(chunks)
-            document.status = DocumentStatus.COMPLETED
-            document.error_message = None
-
-            await self.document_repository.replace_chunks(
-                document.id,
-                [
-                    DocumentChunk(
-                        document_id=document.id,
-                        chunk_index=chunk.index,
-                        content=chunk.content,
-                        char_count=chunk.char_count,
-                    )
-                    for chunk in chunks
-                ],
-            )
-
-            logger.info(
-                "document_processing_completed",
-                extra={"document_id": str(document.id), "chunk_count": len(chunks)},
-            )
-        except Exception as exc:  # noqa: BLE001 — persist failure state
-            await self.document_repository.session.rollback()
-            document.status = DocumentStatus.FAILED
-            document.error_message = str(exc)[:2000]
-            await self.document_repository.session.flush()
-            logger.error(
-                "document_processing_failed",
-                extra={"document_id": str(document.id)},
-                exc_info=exc,
-            )
 
     async def get_for_owner(self, document_id: uuid.UUID, owner_id: uuid.UUID) -> Document:
         document = await self.document_repository.get_by_id_for_owner(document_id, owner_id)
@@ -151,6 +109,11 @@ class DocumentService:
     async def delete_for_owner(self, document_id: uuid.UUID, owner_id: uuid.UUID) -> None:
         document = await self.get_for_owner(document_id, owner_id)
         await self.storage.delete(document.storage_path)
+        # Best-effort vector cleanup — deliberately after storage delete but
+        # before the DB delete, so a Qdrant failure here still leaves the
+        # Postgres row in place to retry against rather than being silently
+        # orphaned on both sides.
+        await self.vector_store.delete_by_filter({"document_id": str(document_id)})
         await self.document_repository.delete(document)
         logger.info("document_deleted", extra={"document_id": str(document_id)})
 

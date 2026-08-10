@@ -1,0 +1,32 @@
+# Keep the Docker build context small and the image free of local/dev-only
+# artifacts. Mirrors .gitignore where relevant, plus VCS/CI metadata that
+# has no business being inside the image.
+
+.git/
+.github/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+venv/
+.venv/
+env/
+ENV/
+
+.env
+.env.*
+!.env.example
+
+storage/
+qdrant_storage/
+
+.vscode/
+.idea/
+.DS_Store
+
+README.md

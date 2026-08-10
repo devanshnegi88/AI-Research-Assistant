@@ -99,16 +99,14 @@ async def update_user(
     return await user_service.update_by_admin(user_id, payload)
 
 
-from fastapi import Response
-
 @router.delete(
     "/{user_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    response_class=Response,
+    response_model=None,
     dependencies=[Depends(require_admin)],
 )
 async def delete_user(
     user_id: uuid.UUID,
     user_service: UserService = Depends(get_user_service),
-):
+) -> None:
     await user_service.delete_user(user_id)

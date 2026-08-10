@@ -78,17 +78,14 @@ async def get_document_status(
     return await document_service.get_for_owner(document_id, current_user.id)
 
 
-from fastapi import Response
-
 @router.delete(
     "/{document_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    response_class=Response,
+    response_model=None,
 )
 async def delete_document(
     document_id: uuid.UUID,
     current_user: User = Depends(get_current_active_user),
     document_service: DocumentService = Depends(get_document_service),
-):
+) -> None:
     await document_service.delete_for_owner(document_id, current_user.id)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
