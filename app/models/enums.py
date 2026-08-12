@@ -30,3 +30,9 @@ class DocumentStatus(str, enum.Enum):
     FAILED = "failed"
     DUPLICATE = "duplicate"
 
+
+class MessageRole(str, enum.Enum):
+    """Who authored a message in a conversation."""
+
+    USER = "user"
+    ASSISTANT = "assistant"

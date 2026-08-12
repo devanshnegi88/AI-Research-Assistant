@@ -9,22 +9,25 @@ import uuid
 
 from fastapi import Depends
 from fastapi.security import OAuth2PasswordBearer
-from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.exceptions import ForbiddenException, InvalidTokenException
 from app.core.security import decode_token
-# from app.db.redis import get_redis
 from app.db.session import get_db
 from app.models.enums import RoleEnum
 from app.models.user import User
 from app.repositories.chunk_repository import ChunkRepository
+from app.repositories.conversation_repository import ConversationRepository
 from app.repositories.document_repository import DocumentRepository
+from app.repositories.message_repository import MessageRepository
 from app.repositories.user_repository import UserRepository
 from app.services.auth_service import AuthService
+from app.services.chat.chat_service import ChatService
+from app.services.chat.memory_manager import MemoryManager
+from app.services.conversation.conversation_service import ConversationService
 from app.services.document.document_service import DocumentService
-from app.services.embeddings.embedding_service import EmbeddingService, get_embedding_service
+from app.services.embedding.embedding_service import EmbeddingService, get_embedding_service
 from app.services.rag.llm_client import LLMClient, get_llm_client
 from app.services.rag.rag_service import RAGService
 from app.services.search.retriever import HybridRetriever
@@ -56,6 +59,16 @@ def get_chunk_repository(db: AsyncSession = Depends(get_db)) -> ChunkRepository:
     return ChunkRepository(db)
 
 
+def get_conversation_repository(
+    db: AsyncSession = Depends(get_db),
+) -> ConversationRepository:
+    return ConversationRepository(db)
+
+
+def get_message_repository(db: AsyncSession = Depends(get_db)) -> MessageRepository:
+    return MessageRepository(db)
+
+
 def get_vector_store_dep() -> VectorStore:
     return get_vector_store()
 
@@ -72,7 +85,6 @@ def get_llm_client_dep() -> LLMClient:
 
 def get_auth_service(
     user_repository: UserRepository = Depends(get_user_repository),
-    # redis: Redis = Depends(get_redis),
 ) -> AuthService:
     return AuthService(user_repository)
 
@@ -93,10 +105,10 @@ def get_document_service(
 
 def get_hybrid_retriever(
     vector_store: VectorStore = Depends(get_vector_store_dep),
-    # embedding_service: EmbeddingService = Depends(get_embedding_service_dep),
+    embedding_service: EmbeddingService = Depends(get_embedding_service_dep),
     chunk_repository: ChunkRepository = Depends(get_chunk_repository),
 ) -> HybridRetriever:
-    return HybridRetriever(vector_store , chunk_repository)
+    return HybridRetriever(vector_store, embedding_service, chunk_repository)
 
 
 def get_search_service(
@@ -112,6 +124,35 @@ def get_rag_service(
     llm_client: LLMClient = Depends(get_llm_client_dep),
 ) -> RAGService:
     return RAGService(search_service, llm_client)
+
+
+def get_conversation_service(
+    conversation_repository: ConversationRepository = Depends(get_conversation_repository),
+    message_repository: MessageRepository = Depends(get_message_repository),
+) -> ConversationService:
+    return ConversationService(conversation_repository, message_repository)
+
+
+def get_memory_manager(
+    llm_client: LLMClient = Depends(get_llm_client_dep),
+) -> MemoryManager:
+    return MemoryManager(llm_client)
+
+
+def get_chat_service(
+    conversation_service: ConversationService = Depends(get_conversation_service),
+    conversation_repository: ConversationRepository = Depends(get_conversation_repository),
+    message_repository: MessageRepository = Depends(get_message_repository),
+    memory_manager: MemoryManager = Depends(get_memory_manager),
+    rag_service: RAGService = Depends(get_rag_service),
+) -> ChatService:
+    return ChatService(
+        conversation_service,
+        conversation_repository,
+        message_repository,
+        memory_manager,
+        rag_service,
+    )
 
 
 # --- Current user / RBAC ---

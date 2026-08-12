@@ -21,6 +21,8 @@ from app.db.base import Base
 
 # Import all models here so Base.metadata is fully populated for autogenerate
 from app.models.user import User  # noqa: F401
+from app.models.document import Document, DocumentChunk  # noqa: F401
+from app.models.conversation import Conversation, Message  # noqa: F401
 
 config = context.config
 config.set_main_option(

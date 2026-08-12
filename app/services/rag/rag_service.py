@@ -5,6 +5,11 @@ and generates an answer via the configured LLM.
 Chunks are numbered [1], [2], ... in the prompt and the model is instructed
 to cite them inline; those same numbers map back to `Citation` objects in
 the response so the client can render clickable sources.
+
+Phase 4: also accepts optional conversation history (a rolling summary +
+recent messages verbatim, assembled by `MemoryManager`) so multi-turn
+conversations stay coherent — a follow-up question like "what about the
+second one?" only makes sense with the prior turn in context.
 """
 
 from __future__ import annotations
@@ -12,21 +17,34 @@ from __future__ import annotations
 import uuid
 
 from app.core.config import settings
+from app.models.conversation import Message
+from app.models.enums import MessageRole
 from app.schemas.chat import Citation
 from app.schemas.search import SearchFilters
 from app.services.rag.llm_client import LLMClient
 from app.services.search.search_service import SearchService
 
 _SYSTEM_PROMPT = (
-    "You are a research assistant answering questions using only the "
-    "provided source excerpts. Rules:\n"
-    "1. Base your answer strictly on the excerpts below — do not use "
-    "outside knowledge.\n"
+    "You are a research assistant answering questions using the provided "
+    "source excerpts and the ongoing conversation. Rules:\n"
+    "1. Base factual claims strictly on the source excerpts — do not use "
+    "outside knowledge for facts about the user's documents.\n"
     "2. Cite sources inline using the bracketed number, e.g. [1], [2], "
     "immediately after the claim it supports.\n"
-    "3. If the excerpts don't contain enough information to answer, say "
+    "3. Use the conversation history to resolve references like \"it\" or "
+    "\"the second one\", and to keep continuity — but only cite sources "
+    "for claims grounded in the excerpts below, not the history itself.\n"
+    "4. If the excerpts don't contain enough information to answer, say "
     "so plainly instead of guessing.\n"
-    "4. Be concise and directly answer the question."
+    "5. Be concise and directly answer the question."
+)
+
+_NO_CONTEXT_SYSTEM_PROMPT = (
+    "You are a research assistant. No source excerpts were found for this "
+    "message. Continue the conversation naturally using the history "
+    "provided, but if the user is asking about their documents, say "
+    "plainly that you couldn't find anything relevant rather than "
+    "guessing."
 )
 
 _EXCERPT_CHAR_LIMIT = 1500
@@ -43,17 +61,29 @@ class RAGService:
         owner_id: uuid.UUID,
         filters: SearchFilters | None = None,
         max_context_chunks: int | None = None,
+        history_messages: list[Message] | None = None,
+        history_summary: str | None = None,
     ) -> tuple[str, list[Citation]]:
         top_k = max_context_chunks or settings.RAG_MAX_CONTEXT_CHUNKS
 
         results = await self.search_service.search(query, owner_id, top_k, filters)
-        if not results:
-            return (
-                "I couldn't find any relevant documents to answer that question.",
-                [],
-            )
+        history_block = self._build_history_block(history_messages, history_summary)
 
-        user_prompt = self._build_prompt(query, results)
+        if not results:
+            if not history_block:
+                return (
+                    "I couldn't find any relevant documents to answer that question.",
+                    [],
+                )
+            # No relevant docs, but there's conversation context — let the
+            # model respond conversationally rather than bailing outright.
+            user_prompt = f"{history_block}Current message: {query}"
+            answer_text = await self.llm_client.generate(
+                _NO_CONTEXT_SYSTEM_PROMPT, user_prompt
+            )
+            return answer_text, []
+
+        user_prompt = self._build_prompt(query, results, history_block)
         answer_text = await self.llm_client.generate(_SYSTEM_PROMPT, user_prompt)
 
         citations = [
@@ -69,7 +99,24 @@ class RAGService:
 
         return answer_text, citations
 
-    def _build_prompt(self, query: str, results: list) -> str:
+    def _build_history_block(
+        self, history_messages: list[Message] | None, history_summary: str | None
+    ) -> str:
+        parts = []
+        if history_summary:
+            parts.append(f"Summary of earlier conversation:\n{history_summary}")
+        if history_messages:
+            transcript = "\n".join(
+                f"{'User' if m.role == MessageRole.USER else 'Assistant'}: {m.content}"
+                for m in history_messages
+            )
+            parts.append(f"Recent conversation:\n{transcript}")
+
+        if not parts:
+            return ""
+        return "\n\n".join(parts) + "\n\n"
+
+    def _build_prompt(self, query: str, results: list, history_block: str) -> str:
         excerpt_blocks = []
         for i, r in enumerate(results, start=1):
             excerpt = r.content[:_EXCERPT_CHAR_LIMIT]
@@ -78,4 +125,7 @@ class RAGService:
             )
 
         excerpts_text = "\n\n".join(excerpt_blocks)
-        return f"Question: {query}\n\nSource excerpts:\n\n{excerpts_text}"
+        return (
+            f"{history_block}Current question: {query}\n\n"
+            f"Source excerpts:\n\n{excerpts_text}"
+        )

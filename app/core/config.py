@@ -10,7 +10,9 @@ full list of required variables.
 from functools import lru_cache
 from typing import Literal
 
+# pyrefly: ignore [missing-import]
 from pydantic import Field, PostgresDsn, field_validator
+# pyrefly: ignore [missing-import]
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -53,13 +55,12 @@ class Settings(BaseSettings):
     DB_MAX_OVERFLOW: int = 20
     DB_ECHO: bool = False
 
-# --- Redis ---  # NOTE: Redis removed from the app — kept here only for reference.
-    # REDIS_HOST: str = "localhost"
-    # REDIS_PORT: int = 6379
-    # REDIS_DB: int = 0
-    # REDIS_PASSWORD: str | None = None
+    # --- Redis ---
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
+    REDIS_DB: int = 0
+    REDIS_PASSWORD: str | None = None
     # REDIS_URL: RedisDsn | None = None
-    # USE_REDIS: bool = False
 
     # @field_validator("REDIS_URL", mode="before")
     # @classmethod
@@ -83,9 +84,9 @@ class Settings(BaseSettings):
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     LOG_JSON: bool = False
 
-    # --- Celery ---  # NOTE: Celery removed (it depended on Redis as broker).
-    # CELERY_BROKER_URL: str | None = None
-    # CELERY_RESULT_BACKEND: str | None = None
+    # --- Celery ---
+    CELERY_BROKER_URL: str | None = None
+    CELERY_RESULT_BACKEND: str | None = None
 
     # @field_validator("CELERY_BROKER_URL", mode="before")
     # @classmethod
@@ -120,6 +121,38 @@ class Settings(BaseSettings):
     OCR_LANGUAGES: list[str] = ["en"]
     CHUNK_SIZE_CHARS: int = 1000
     CHUNK_OVERLAP_CHARS: int = 150
+
+    # --- Embeddings ---
+    EMBEDDING_MODEL_NAME: str = "BAAI/bge-small-en-v1.5"
+    EMBEDDING_DIM: int = 384
+    EMBEDDING_BATCH_SIZE: int = 32
+
+    # --- Qdrant ---
+    QDRANT_HOST: str = "localhost"
+    QDRANT_PORT: int = 6333
+    QDRANT_COLLECTION_NAME: str = "document_chunks"
+    QDRANT_API_KEY: str | None = None
+
+    # --- Hybrid search ---
+    SEARCH_TOP_K: int = 10
+    SEARCH_CANDIDATE_POOL_SIZE: int = 50  # per-method pool before RRF fusion
+    RRF_K: int = 60  # standard Reciprocal Rank Fusion smoothing constant
+
+    # --- RAG / LLM ---
+    GEMINI_API_KEY: str | None = None
+    GEMINI_MODEL_NAME: str = "gemini-2.0-flash"
+    RAG_MAX_CONTEXT_CHUNKS: int = 6
+    RAG_TEMPERATURE: float = 0.2
+
+    # --- Conversation memory / context window ---
+    # Token counts here are a `len(text) // 4` heuristic (see
+    # services/chat/memory_manager.py) — there's no free local tokenizer
+    # for Gemini equivalent to tiktoken, and calling the API to count
+    # tokens on every memory decision would add a round-trip per turn.
+    MEMORY_MAX_HISTORY_TOKENS: int = 3000  # budget for verbatim recent turns
+    MEMORY_MIN_RECENT_TURNS: int = 2  # always keep at least this many turns verbatim
+    MEMORY_SUMMARY_MAX_TOKENS: int = 500  # target length for the rolling summary
+    MEMORY_SUMMARIZE_AFTER_MESSAGES: int = 10  # re-summarize once this many new messages have aged out
 
 
 @lru_cache

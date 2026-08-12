@@ -1,12 +1,11 @@
 """
 Document business logic.
 
-Upload is split across two phases:
-1. `upload()` (this file, runs in the API request) — validate, hash-check
-   for duplicates, persist to storage, insert a `pending` DB row, enqueue
-   the Celery task. Fast — no extraction/OCR happens here.
-2. `process_document` (Celery task, `workers/tasks.py`) — does the actual
-   extraction, cleaning, and chunking, then updates the row's status.
+Upload flow: validate → dedup check → persist to storage → insert DB row →
+extract text → clean → chunk → embed → index in vector store.
+
+Previously Celery dispatched; now runs inline in the API request since
+Redis / Celery have been removed from the stack.
 """
 
 from __future__ import annotations
@@ -16,13 +15,17 @@ import uuid
 from app.core.config import settings
 from app.core.exceptions import BadRequestException, NotFoundException
 from app.core.logging import get_logger
-from app.models.document import Document
+from app.models.document import Document, DocumentChunk
 from app.models.enums import DocumentStatus, DocumentType
 from app.repositories.document_repository import DocumentRepository
 from app.schemas.common import PaginatedResponse
+from app.services.document.chunking import chunk_text
 from app.services.document.duplicate_detection import compute_content_hash
+from app.services.document.extractors import get_extractor
+from app.services.document.text_cleaning import clean_text
+from app.services.embedding.embedding_service import get_embedding_service
 from app.storage.base import StorageBackend
-from app.vectorstore.base import VectorStore
+from app.vectorstore.base import VectorRecord, VectorStore
 
 logger = get_logger(__name__)
 
@@ -83,14 +86,71 @@ class DocumentService:
         )
         document = await self.document_repository.create(document)
 
-        # Imported lazily to avoid a hard import-time dependency from the
-        # API process on the Celery app configuration.
-        from app.workers.tasks import process_document
-
-        process_document.delay(str(document.id))
+        # Process inline (Celery was removed from the stack).
+        try:
+            await self._process_document(document, file_bytes)
+        except Exception as exc:  # noqa: BLE001 — must persist failure state
+            document.status = DocumentStatus.FAILED
+            document.error_message = str(exc)[:2000]
+            logger.error(
+                "document_processing_failed",
+                extra={"document_id": str(document.id)},
+                exc_info=exc,
+            )
 
         logger.info("document_upload_accepted", extra={"document_id": str(document.id)})
         return document
+
+    async def _process_document(self, document: Document, file_bytes: bytes) -> None:
+        """Extract → clean → chunk → embed → index.  Runs inline."""
+        document.status = DocumentStatus.PROCESSING
+
+        extractor = get_extractor(document.document_type)
+        result = extractor.extract(file_bytes)
+
+        cleaned_text = clean_text(result.text)
+        chunks = chunk_text(cleaned_text)
+
+        chunk_rows = [
+            DocumentChunk(
+                id=uuid.uuid4(),
+                document_id=document.id,
+                chunk_index=chunk.index,
+                content=chunk.content,
+                char_count=chunk.char_count,
+            )
+            for chunk in chunks
+        ]
+
+        # Embed and index into vector store
+        if chunk_rows:
+            embedding_service = get_embedding_service()
+            vectors = embedding_service.embed_batch([c.content for c in chunk_rows])
+
+            records = [
+                VectorRecord(
+                    id=chunk.id,
+                    vector=vector,
+                    payload={
+                        "owner_id": str(document.owner_id),
+                        "document_id": str(document.id),
+                        "document_type": document.document_type.value,
+                        "chunk_index": chunk.chunk_index,
+                    },
+                )
+                for chunk, vector in zip(chunk_rows, vectors)
+            ]
+
+            await self.vector_store.delete_by_filter({"document_id": str(document.id)})
+            await self.vector_store.upsert(records)
+
+        document.extracted_text = cleaned_text
+        document.doc_metadata = {**result.metadata, "used_ocr": result.used_ocr}
+        document.chunk_count = len(chunks)
+        document.status = DocumentStatus.COMPLETED
+        document.error_message = None
+
+        await self.document_repository.replace_chunks(document.id, chunk_rows)
 
     async def get_for_owner(self, document_id: uuid.UUID, owner_id: uuid.UUID) -> Document:
         document = await self.document_repository.get_by_id_for_owner(document_id, owner_id)
