@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import uuid
 
+# pyrefly: ignore [missing-import]
 from fastapi import Depends
+# pyrefly: ignore [missing-import]
 from fastapi.security import OAuth2PasswordBearer
+# pyrefly: ignore [missing-import]
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings

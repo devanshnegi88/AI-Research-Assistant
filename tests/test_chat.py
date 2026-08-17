@@ -1,10 +1,10 @@
 """
-Tests for `/chat` (RAG).
+Tests for `/chat` — retrieval-augmented generation, now routed through
+ChatService (conversation resolution + memory + RAG + persistence).
 
-The LLM client and search service are mocked — these tests verify the API
-contract (auth, request validation, citation shape) and that citation
-numbering in the response matches the retrieved chunks, without calling
-Gemini or requiring real embeddings/Qdrant/BM25 data.
+The LLM client and search service are mocked at the DI layer throughout;
+Postgres is real (see conftest.py), so conversation/message persistence
+and multi-turn history are exercised for real, not mocked.
 """
 
 from __future__ import annotations
@@ -128,3 +128,150 @@ async def test_chat_returns_citations_matching_retrieved_chunks(client: AsyncCli
     assert len(body["citations"]) == 1
     assert body["citations"][0]["chunk_id"] == str(chunk_id)
     assert body["citations"][0]["document_filename"] == "report.pdf"
+
+
+# --- Phase 4: multi-turn conversation behavior ---
+
+
+async def test_chat_without_conversation_id_creates_new_conversation(
+    client: AsyncClient,
+):
+    from app.core.dependencies import get_llm_client_dep, get_search_service
+    from app.main import app
+
+    token = await _register_and_login(client, "chat-newconv@example.com")
+
+    app.dependency_overrides[get_search_service] = lambda: AsyncMock(
+        search=AsyncMock(return_value=[])
+    )
+    app.dependency_overrides[get_llm_client_dep] = lambda: AsyncMock(
+        generate=AsyncMock(return_value="Hi there!")
+    )
+    try:
+        response = await client.post(
+            "/api/v1/chat",
+            json={"message": "Hello"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_search_service, None)
+        app.dependency_overrides.pop(get_llm_client_dep, None)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["conversation_id"]
+    assert body["message_id"]
+
+
+async def test_second_message_reuses_conversation_and_persists_history(
+    client: AsyncClient,
+):
+    from app.core.dependencies import get_llm_client_dep, get_search_service
+    from app.main import app
+
+    token = await _register_and_login(client, "chat-multiturn@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    app.dependency_overrides[get_search_service] = lambda: AsyncMock(
+        search=AsyncMock(return_value=[])
+    )
+    app.dependency_overrides[get_llm_client_dep] = lambda: AsyncMock(
+        generate=AsyncMock(return_value="OK")
+    )
+    try:
+        first = await client.post(
+            "/api/v1/chat", json={"message": "My name is Alex."}, headers=headers
+        )
+        conversation_id = first.json()["conversation_id"]
+
+        second = await client.post(
+            "/api/v1/chat",
+            json={"message": "What's my name?", "conversation_id": conversation_id},
+            headers=headers,
+        )
+    finally:
+        app.dependency_overrides.pop(get_search_service, None)
+        app.dependency_overrides.pop(get_llm_client_dep, None)
+
+    assert second.status_code == 200
+    assert second.json()["conversation_id"] == conversation_id
+
+    history = await client.get(f"/api/v1/conversations/{conversation_id}", headers=headers)
+    messages = history.json()["messages"]
+    assert len(messages) == 4  # 2 user + 2 assistant
+    assert messages[0]["content"] == "My name is Alex."
+    assert messages[2]["content"] == "What's my name?"
+
+
+async def test_second_message_passes_history_to_rag_service(client: AsyncClient):
+    """Verifies the actual memory wiring — not just that persistence
+    happened, but that the prior turn was handed to RAGService.answer()
+    for the second message.
+
+    Note: ChatService depends on both get_rag_service AND
+    get_memory_manager, and each independently resolves get_llm_client_dep
+    — overriding only one leaves the other constructing a real
+    GeminiLLMClient, which fails fast without GEMINI_API_KEY.
+    """
+    from app.core.dependencies import get_llm_client_dep, get_rag_service
+    from app.main import app
+
+    token = await _register_and_login(client, "chat-memorywiring@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    fake_rag = AsyncMock()
+    fake_rag.answer = AsyncMock(return_value=("some answer", []))
+    app.dependency_overrides[get_rag_service] = lambda: fake_rag
+    app.dependency_overrides[get_llm_client_dep] = lambda: AsyncMock()
+    try:
+        first = await client.post(
+            "/api/v1/chat", json={"message": "First message"}, headers=headers
+        )
+        conversation_id = first.json()["conversation_id"]
+
+        await client.post(
+            "/api/v1/chat",
+            json={"message": "Second message", "conversation_id": conversation_id},
+            headers=headers,
+        )
+    finally:
+        app.dependency_overrides.pop(get_rag_service, None)
+        app.dependency_overrides.pop(get_llm_client_dep, None)
+
+    assert fake_rag.answer.await_count == 2
+    second_call_kwargs = fake_rag.answer.await_args_list[1].kwargs
+    history_messages = second_call_kwargs["history_messages"]
+    assert any(m.content == "First message" for m in history_messages)
+
+
+async def test_cannot_continue_other_users_conversation(client: AsyncClient):
+    from app.core.dependencies import get_llm_client_dep, get_search_service
+    from app.main import app
+
+    token_a = await _register_and_login(client, "chat-owner@example.com")
+    token_b = await _register_and_login(client, "chat-intruder@example.com")
+
+    app.dependency_overrides[get_search_service] = lambda: AsyncMock(
+        search=AsyncMock(return_value=[])
+    )
+    app.dependency_overrides[get_llm_client_dep] = lambda: AsyncMock(
+        generate=AsyncMock(return_value="OK")
+    )
+    try:
+        first = await client.post(
+            "/api/v1/chat",
+            json={"message": "private"},
+            headers={"Authorization": f"Bearer {token_a}"},
+        )
+        conversation_id = first.json()["conversation_id"]
+
+        intruding = await client.post(
+            "/api/v1/chat",
+            json={"message": "trying to continue", "conversation_id": conversation_id},
+            headers={"Authorization": f"Bearer {token_b}"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_search_service, None)
+        app.dependency_overrides.pop(get_llm_client_dep, None)
+
+    assert intruding.status_code == 404

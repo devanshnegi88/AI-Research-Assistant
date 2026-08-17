@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 
+# pyrefly: ignore [missing-import]
 from sqlalchemy import func, select
 
 from app.models.conversation import Conversation
