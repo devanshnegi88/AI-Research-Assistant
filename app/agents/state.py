@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import TypedDict
 
-from app.models.conversation import Message
+from app.models.conversation import MessageRead
 from app.schemas.agent import ExecutionPlan, Intent, SubTask
 
 
@@ -18,7 +18,7 @@ class PlannerState(TypedDict, total=False):
     # --- Input (set before the graph runs, never mutated by nodes) ---
     message: str
     history_summary: str | None
-    history_messages: list[Message]
+    history_messages: list[MessageRead] | None
 
     # --- Populated by classify_intent ---
     intent: Intent
