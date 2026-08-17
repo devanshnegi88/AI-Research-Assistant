@@ -275,3 +275,84 @@ async def test_cannot_continue_other_users_conversation(client: AsyncClient):
         app.dependency_overrides.pop(get_llm_client_dep, None)
 
     assert intruding.status_code == 404
+
+
+# --- Phase 5: planner-driven routing, exercised through the real endpoint ---
+# (unit-level coverage of every routing branch and fallback path lives in
+# tests/test_planner_agent.py — these confirm the /chat HTTP contract and
+# that chitchat genuinely skips retrieval, not just that the agent decides
+# it should.)
+
+
+async def test_chat_response_includes_intent_and_subtask_queries(client: AsyncClient):
+    from app.core.dependencies import get_llm_client_dep, get_search_service
+    from app.main import app
+
+    token = await _register_and_login(client, "chat-intentfield@example.com")
+
+    app.dependency_overrides[get_search_service] = lambda: AsyncMock(
+        search=AsyncMock(return_value=[])
+    )
+    app.dependency_overrides[get_llm_client_dep] = lambda: AsyncMock(
+        generate=AsyncMock(return_value="some plain text response")
+    )
+    try:
+        response = await client.post(
+            "/api/v1/chat",
+            json={"message": "What does the report say?"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_search_service, None)
+        app.dependency_overrides.pop(get_llm_client_dep, None)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "intent" in body
+    assert "subtask_queries" in body
+    # Non-JSON mock output forces the planner's documented fallback path —
+    # this IS the safety behavior under test, not an incidental detail.
+    assert body["intent"] == "document_question"
+    assert body["subtask_queries"] == ["What does the report say?"]
+
+
+async def test_chitchat_intent_skips_retrieval_entirely(client: AsyncClient):
+    import json as jsonlib
+
+    from app.core.dependencies import get_llm_client_dep, get_search_service
+    from app.main import app
+
+    token = await _register_and_login(client, "chat-chitchat@example.com")
+
+    fake_search_service = AsyncMock()
+    fake_search_service.search = AsyncMock(return_value=[])
+
+    fake_llm = AsyncMock()
+    fake_llm.generate = AsyncMock(
+        side_effect=[
+            jsonlib.dumps({"intent": "chitchat"}),  # classify_intent
+            "Hi there! I can help you search your documents.",  # generate_direct_response
+        ]
+    )
+
+    app.dependency_overrides[get_search_service] = lambda: fake_search_service
+    app.dependency_overrides[get_llm_client_dep] = lambda: fake_llm
+    try:
+        response = await client.post(
+            "/api/v1/chat",
+            json={"message": "hello!"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_search_service, None)
+        app.dependency_overrides.pop(get_llm_client_dep, None)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["intent"] == "chitchat"
+    assert body["subtask_queries"] == []
+    assert body["citations"] == []
+    assert body["answer"] == "Hi there! I can help you search your documents."
+
+    # The real assertion: retrieval was never attempted for a chitchat turn.
+    fake_search_service.search.assert_not_awaited()

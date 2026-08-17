@@ -15,7 +15,6 @@ from pydantic import Field, PostgresDsn, field_validator
 # pyrefly: ignore [missing-import]
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 class Settings(BaseSettings):
     """Strongly-typed application settings, populated from environment."""
 
@@ -154,6 +153,9 @@ class Settings(BaseSettings):
     MEMORY_SUMMARY_MAX_TOKENS: int = 500  # target length for the rolling summary
     MEMORY_SUMMARIZE_AFTER_MESSAGES: int = 10  # re-summarize once this many new messages have aged out
 
+        # --- Planner agent (LangGraph) ---
+    PLANNER_MAX_SUBTASKS: int = 4  # cap decomposition — bounds retrieval fan-out and latency
+    PLANNER_TEMPERATURE: float = 0.0  # deterministic-as-possible for classification/routing decisions
 
 @lru_cache
 def get_settings() -> Settings:

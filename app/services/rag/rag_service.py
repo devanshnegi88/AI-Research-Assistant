@@ -10,6 +10,12 @@ Phase 4: also accepts optional conversation history (a rolling summary +
 recent messages verbatim, assembled by `MemoryManager`) so multi-turn
 conversations stay coherent — a follow-up question like "what about the
 second one?" only makes sense with the prior turn in context.
+
+Phase 5: `answer()` remains the single-query path (unchanged — most
+questions are one subtask). `synthesize()` is new — it takes
+already-retrieved, already-merged results from the planner's possibly
+multiple subtasks and generates one coherent, citation-grounded answer to
+the *original* user question, rather than doing its own retrieval.
 """
 
 from __future__ import annotations
@@ -20,7 +26,7 @@ from app.core.config import settings
 from app.models.conversation import Message
 from app.models.enums import MessageRole
 from app.schemas.chat import Citation
-from app.schemas.search import SearchFilters
+from app.schemas.search import SearchFilters, SearchResultItem
 from app.services.rag.llm_client import LLMClient
 from app.services.search.search_service import SearchService
 
@@ -37,6 +43,20 @@ _SYSTEM_PROMPT = (
     "4. If the excerpts don't contain enough information to answer, say "
     "so plainly instead of guessing.\n"
     "5. Be concise and directly answer the question."
+)
+
+_SYNTHESIS_SYSTEM_PROMPT = (
+    "You are a research assistant. The excerpts below were gathered from "
+    "several separate searches to answer one user question with multiple "
+    "parts (e.g. a comparison). Synthesize ONE coherent answer that "
+    "addresses all parts of the question — do not just answer each part "
+    "in isolation; connect them where relevant (e.g. explicitly compare "
+    "or contrast). Rules:\n"
+    "1. Base factual claims strictly on the source excerpts.\n"
+    "2. Cite sources inline using the bracketed number, e.g. [1], [2].\n"
+    "3. If some parts of the question have no supporting excerpts, say so "
+    "for that part specifically rather than skipping it silently.\n"
+    "4. Be concise."
 )
 
 _NO_CONTEXT_SYSTEM_PROMPT = (
@@ -83,10 +103,48 @@ class RAGService:
             )
             return answer_text, []
 
-        user_prompt = self._build_prompt(query, results, history_block)
+        user_prompt = self._build_prompt(
+            "Current question", query, results, history_block
+        )
         answer_text = await self.llm_client.generate(_SYSTEM_PROMPT, user_prompt)
 
-        citations = [
+        return answer_text, self._to_citations(results)
+
+    async def synthesize(
+        self,
+        original_query: str,
+        results: list[SearchResultItem],
+        history_messages: list[Message] | None = None,
+        history_summary: str | None = None,
+    ) -> tuple[str, list[Citation]]:
+        """Generate from results the caller already retrieved (and merged
+        across however many subtasks the planner decomposed the question
+        into) — no retrieval happens here."""
+        history_block = self._build_history_block(history_messages, history_summary)
+
+        if not results:
+            if not history_block:
+                return (
+                    "I couldn't find any relevant documents to answer that question.",
+                    [],
+                )
+            user_prompt = f"{history_block}Current message: {original_query}"
+            answer_text = await self.llm_client.generate(
+                _NO_CONTEXT_SYSTEM_PROMPT, user_prompt
+            )
+            return answer_text, []
+
+        user_prompt = self._build_prompt(
+            "Original question", original_query, results, history_block
+        )
+        answer_text = await self.llm_client.generate(
+            _SYNTHESIS_SYSTEM_PROMPT, user_prompt
+        )
+
+        return answer_text, self._to_citations(results)
+
+    def _to_citations(self, results: list[SearchResultItem]) -> list[Citation]:
+        return [
             Citation(
                 chunk_id=r.chunk_id,
                 document_id=r.document_id,
@@ -96,8 +154,6 @@ class RAGService:
             )
             for r in results
         ]
-
-        return answer_text, citations
 
     def _build_history_block(
         self, history_messages: list[Message] | None, history_summary: str | None
@@ -116,7 +172,13 @@ class RAGService:
             return ""
         return "\n\n".join(parts) + "\n\n"
 
-    def _build_prompt(self, query: str, results: list, history_block: str) -> str:
+    def _build_prompt(
+        self,
+        question_label: str,
+        query: str,
+        results: list[SearchResultItem],
+        history_block: str,
+    ) -> str:
         excerpt_blocks = []
         for i, r in enumerate(results, start=1):
             excerpt = r.content[:_EXCERPT_CHAR_LIMIT]
@@ -126,6 +188,6 @@ class RAGService:
 
         excerpts_text = "\n\n".join(excerpt_blocks)
         return (
-            f"{history_block}Current question: {query}\n\n"
+            f"{history_block}{question_label}: {query}\n\n"
             f"Source excerpts:\n\n{excerpts_text}"
         )

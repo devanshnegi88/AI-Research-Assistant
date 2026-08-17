@@ -7,16 +7,16 @@ from __future__ import annotations
 
 import uuid
 
-# pyrefly: ignore [missing-import]
 from fastapi import Depends
-# pyrefly: ignore [missing-import]
 from fastapi.security import OAuth2PasswordBearer
-# pyrefly: ignore [missing-import]
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.planner_agent import PlannerAgent
 from app.core.config import settings
 from app.core.exceptions import ForbiddenException, InvalidTokenException
 from app.core.security import decode_token
+from app.db.redis import get_redis
 from app.db.session import get_db
 from app.models.enums import RoleEnum
 from app.models.user import User
@@ -88,8 +88,9 @@ def get_llm_client_dep() -> LLMClient:
 
 def get_auth_service(
     user_repository: UserRepository = Depends(get_user_repository),
+    redis: Redis = Depends(get_redis),
 ) -> AuthService:
-    return AuthService(user_repository)
+    return AuthService(user_repository, redis)
 
 
 def get_user_service(
@@ -142,12 +143,20 @@ def get_memory_manager(
     return MemoryManager(llm_client)
 
 
+def get_planner_agent(
+    llm_client: LLMClient = Depends(get_llm_client_dep),
+) -> PlannerAgent:
+    return PlannerAgent(llm_client)
+
+
 def get_chat_service(
     conversation_service: ConversationService = Depends(get_conversation_service),
     conversation_repository: ConversationRepository = Depends(get_conversation_repository),
     message_repository: MessageRepository = Depends(get_message_repository),
     memory_manager: MemoryManager = Depends(get_memory_manager),
     rag_service: RAGService = Depends(get_rag_service),
+    search_service: SearchService = Depends(get_search_service),
+    planner_agent: PlannerAgent = Depends(get_planner_agent),
 ) -> ChatService:
     return ChatService(
         conversation_service,
@@ -155,6 +164,8 @@ def get_chat_service(
         message_repository,
         memory_manager,
         rag_service,
+        search_service,
+        planner_agent,
     )
 
 
