@@ -1,29 +1,41 @@
-"""Hybrid search route — retrieval only, no generation."""
+"""Search-related Pydantic DTOs used across the retrieval and chat flows."""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+import uuid
 
-from app.core.dependencies import get_current_active_user, get_search_service
-from app.models.user import User
-from app.schemas.search import SearchQuery, SearchResponse
-from app.services.search.search_service import SearchService
+from pydantic import BaseModel, ConfigDict, Field
 
-router = APIRouter(prefix="/search", tags=["search"])
+from app.models.enums import DocumentType
 
 
-@router.post("", response_model=SearchResponse)
-async def search_documents(
-    payload: SearchQuery,
-    current_user: User = Depends(get_current_active_user),
-    search_service: SearchService = Depends(get_search_service),
-) -> SearchResponse:
-    results = await search_service.search(
-        query=payload.query,
-        owner_id=current_user.id,
-        top_k=payload.top_k,
-        filters=payload.filters,
-    )
-    return SearchResponse(
-        query=payload.query, results=results, total_results=len(results)
-    )
+class SearchFilters(BaseModel):
+    """Optional filters applied during retrieval."""
+
+    document_type: DocumentType | None = None
+    document_ids: list[uuid.UUID] | None = None
+    filename_contains: str | None = None
+
+
+class SearchQuery(BaseModel):
+    query: str = Field(..., min_length=1)
+    top_k: int = Field(default=5, ge=1, le=25)
+    filters: SearchFilters | None = None
+
+
+class SearchResultItem(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    chunk_id: uuid.UUID
+    document_id: uuid.UUID
+    document_filename: str
+    chunk_index: int
+    content: str
+    score: float
+    rank: int
+
+
+class SearchResponse(BaseModel):
+    query: str
+    results: list[SearchResultItem] = Field(default_factory=list)
+    total_results: int
